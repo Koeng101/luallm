@@ -1,0 +1,55 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LuaLLM</title>
+    <script>
+      document.addEventListener('DOMContentLoaded', function() {
+          var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+          var wsUrl = protocol + window.location.host + '/chat';
+          var ws = new WebSocket(wsUrl);
+
+          var chat = ""; // Array to store message objects
+
+          ws.onopen = function() {
+              console.log('Connected to the chat server');
+          };
+
+          ws.onmessage = function(event) {
+            chat = chat + event.data
+            renderMessages();
+          };
+
+          function escapeHTML(unsafeText) {
+            return unsafeText
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+          function renderMessages() {
+              var chatHTML = document.getElementById('chat');
+              chatHTML.innerHTML = `<pre><code>` + escapeHTML(chat) + `</code></pre>`;
+          }
+
+          document.getElementById('send').onclick = function() {
+            var input = document.getElementById('message');
+            ws.send(chat + input.value);
+            chat = ""; // chat is reset. The system always returns the full prompt thus far, making the system stateless.
+          };
+      });
+    </script>
+</head>
+<body>
+  <h1>chat</h1>
+  <div id="chat"></div>
+  <textarea id="message" placeholder="Your message..." style="width: 400px; height: 100px;"></textarea>
+  <button id="send">Send</button>
+
+  <h2>info</h2>
+  <p>The chat contains the entire context window in raw-text (rendered for markdown).</p>
+  <p>It won't look like a normal chatbot because nothing is hidden, as this is meant as a tool to understand how an interaction with an LLM like this would work.</p>
+  <p>You are meant to be able to read both the source code and the prompt and understand it completely.</p>
+</body>
+</html>
