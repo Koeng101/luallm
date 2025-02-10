@@ -18,11 +18,17 @@ import (
 )
 
 // export API_KEY="" # get from deepinfra
-// export MODEL="microsoft/WizardLM-2-8x22B"
+// export MODEL="meta-llama/Llama-3.3-70B-Instruct-Turbo"
 // export BASE_URL="https://api.deepinfra.com/v1/openai"
 // export PORT=8080
 
-var LuaPrompt = "Please respond ONLY with valid lua. The code will directly be loaded into a lua sandbox. If ANY math is used, write lua to do the math, do not attempt it yourself. Print a statement back to the user that answers their query. Be as concise as possible."
+var LuaPrompt = `If you are doing math, use a lua sandbox, which can be used accessed by writing lua code in bewteen two lua XML blocks. The code will directly be loaded into a lua sandbox. Here is an example of running a math problem in a sandbox:
+user: What is 8+8?
+assistant: <lua>
+print(8+8)
+</lua>
+tool: 16
+Only use Lua when performing calculations. When using lua, make sure to enclose the lua with lua XML. For non-mathematical queries, respond normally without Lua code. Always be concise.`
 
 func main() {
 	app := InitializeApp()
@@ -64,6 +70,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		config.BaseURL = baseUrl
 	}
 	client := openai.NewClientWithConfig(config)
+
 	for {
 		messageType, p, err := conn.ReadMessage()
 		if err != nil {
@@ -71,53 +78,66 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		msg := string(p)
-		// A long message might indicate we need to add to the prompt
-		var prompt string
-		systemStart := "<|im_start|>system\n"
-		userRequest := "<|im_end|>\n<|im_start|>user\n"
-		assistantCompletion := "\n<|im_end|>\n<|im_start|>assistant\n```lua\n"
-		toolCompletion := "<|im_end|>\n<|im_start|>tool\nTool Output:\n"
-		if len(msg) > 14 {
-			if msg[0:12] == "<|im_start|>" {
-				prompt = msg + assistantCompletion
+
+		// Parse existing conversation or create new one
+		var messages []openai.ChatCompletionMessage
+		if len(msg) > 14 && msg[0:15] == "<|begin_of_text" {
+			// Use existing conversation context
+			parsedMsgs := parseToMessages(msg)
+			for _, m := range parsedMsgs {
+				role := m.Role
+				// Map roles to OpenAI chat roles
+				switch role {
+				case "system":
+					role = "system"
+				case "user":
+					role = "user"
+				case "assistant":
+					role = "assistant"
+				}
+				messages = append(messages, openai.ChatCompletionMessage{
+					Role:    role,
+					Content: m.Content,
+				})
+			}
+		} else {
+			// Create new conversation
+			messages = []openai.ChatCompletionMessage{
+				{
+					Role:    "system",
+					Content: LuaPrompt,
+				},
+				{
+					Role:    "user",
+					Content: msg,
+				},
 			}
 		}
-		if prompt == "" {
-			prompt = systemStart + LuaPrompt + userRequest + msg + assistantCompletion
-		}
 
-		stream, err := client.CreateCompletionStream(
+		stream, err := client.CreateChatCompletionStream(
 			context.Background(),
-			openai.CompletionRequest{
-				Model:  model,
-				Prompt: prompt,
-				Stream: true,
-				Stop:   []string{"```"},
+			openai.ChatCompletionRequest{
+				Model:    model,
+				Messages: messages,
+				Stream:   true,
 			},
 		)
+
 		if err != nil {
-			fmt.Printf("CompletionStream error: %v\n", err)
+			fmt.Printf("ChatCompletionStream error: %v\n", err)
 			return
 		}
 
 		var luaCode strings.Builder
-		luaCode.WriteString("```lua\n")
-		_ = conn.WriteMessage(messageType, []byte(prompt))
-		var promptTokens int
-		var completionTokens int
-		var totalTokens int
+		// Construct and send the conversation context
+		contextMsg := constructConversationContext(messages)
+		_ = conn.WriteMessage(messageType, []byte(contextMsg))
+
+		var insideLua bool = false
 		for {
-			var response openai.CompletionResponse
+			var response openai.ChatCompletionStreamResponse
 			response, err = stream.Recv()
 			if errors.Is(err, io.EOF) {
-				finalLine := ""
-				for !strings.HasSuffix(luaCode.String()+finalLine, "```") {
-					finalLine = finalLine + "`"
-				}
-				finalLine = finalLine + "\n"
-				luaCode.WriteString(finalLine)
-				_ = conn.WriteMessage(messageType, []byte(finalLine))
-				totalTokens = promptTokens + completionTokens
 				break
 			}
 
@@ -125,44 +145,77 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("\nStream error: %v\n", err)
 				break
 			}
-			token := response.Choices[0].Text
-			luaCode.WriteString(token)
-			_ = conn.WriteMessage(messageType, []byte(token))
 
-			promptTokens = response.Usage.PromptTokens
-			completionTokens = completionTokens + response.Usage.CompletionTokens
-		}
-		fmt.Printf("PromptTokens=%d, CompletionTokens=%d, TotalTokens=%d\n", promptTokens, completionTokens, totalTokens)
-		stream.Close()
-		// Parse out the lua
-		input := luaCode.String()
-		prompt = prompt + input
-		var luaRawCode string
-		// Check for ```lua ... ```
-		luaPrefix := "```lua"
-		codeSuffix := "```"
-		luaStartIndex := strings.Index(input, luaPrefix)
-		if luaStartIndex != -1 {
-			luaEndIndex := strings.Index(input[luaStartIndex+len(luaPrefix):], codeSuffix)
-			if luaEndIndex != -1 {
-				luaRawCode = input[luaStartIndex+len(luaPrefix) : luaStartIndex+len(luaPrefix)+luaEndIndex]
+			if len(response.Choices) > 0 {
+				token := response.Choices[0].Delta.Content
+				if strings.Contains(luaCode.String(), "<lua>") {
+					insideLua = true
+				}
+
+				luaCode.WriteString(token)
+				_ = conn.WriteMessage(messageType, []byte(token))
 			}
 		}
-		// Execute the lua
-		output, err := ExecuteLua(luaRawCode)
-		_ = conn.WriteMessage(messageType, []byte(toolCompletion))
-		prompt = prompt + toolCompletion
-		if err != nil {
-			errorMsg := fmt.Sprintf("Got error: %s", err.Error())
-			prompt = prompt + errorMsg
-			_ = conn.WriteMessage(messageType, []byte(errorMsg))
-		} else {
-			prompt = prompt + output
-			_ = conn.WriteMessage(messageType, []byte(output))
+
+		stream.Close()
+
+		// Handle Lua execution if present
+		input := luaCode.String()
+		var luaRawCode string
+		if insideLua {
+			luaPrefix := "<lua>"
+			codeSuffix := "</lua>"
+			luaStartIndex := strings.Index(input, luaPrefix)
+			if luaStartIndex != -1 {
+				luaEndIndex := strings.Index(input[luaStartIndex+len(luaPrefix):], codeSuffix)
+				if luaEndIndex != -1 {
+					luaRawCode = input[luaStartIndex+len(luaPrefix) : luaStartIndex+len(luaPrefix)+luaEndIndex]
+				}
+			}
+
+			output, err := ExecuteLua(luaRawCode)
+			toolHeader := "\n<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>\ntool:\n"
+			_ = conn.WriteMessage(messageType, []byte(toolHeader))
+
+			if err != nil {
+				errorMsg := fmt.Sprintf("Got error: %s", err.Error())
+				_ = conn.WriteMessage(messageType, []byte(errorMsg))
+			} else {
+				_ = conn.WriteMessage(messageType, []byte(output))
+			}
 		}
 
-		_ = conn.WriteMessage(messageType, []byte(userRequest))
+		userHeader := "\n<|eot_id|>\n<|start_header_id|>user<|end_header_id|>\n"
+		_ = conn.WriteMessage(messageType, []byte(userHeader))
 	}
+}
+
+// Helper function to construct conversation context in the expected format
+func constructConversationContext(messages []openai.ChatCompletionMessage) string {
+	var result strings.Builder
+	result.WriteString("<|begin_of_text|>")
+
+	for i, msg := range messages {
+		if i > 0 {
+			result.WriteString("\n<|eot_id|>\n")
+		}
+
+		role := msg.Role
+		// Map OpenAI roles back to our format
+		switch role {
+		case "system":
+			result.WriteString("<|start_header_id|>system<|end_header_id|>\n")
+		case "user":
+			result.WriteString("<|start_header_id|>user<|end_header_id|>\n")
+		case "assistant":
+			result.WriteString("<|start_header_id|>assistant<|end_header_id|>\n")
+		}
+
+		result.WriteString(msg.Content)
+	}
+
+	result.WriteString("\n<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>\n")
+	return result.String()
 }
 
 // customPrint is a function that mimics Lua's print function but writes to an io.Writer.
@@ -176,7 +229,6 @@ func customPrint(writer io.Writer) func(L *lua.LState) int {
 			}
 			io.WriteString(writer, str)
 		}
-		io.WriteString(writer, "\n")
 		return 0 // Number of results.
 	}
 }
@@ -195,6 +247,61 @@ func ExecuteLua(code string) (string, error) {
 	}
 
 	return buffer.String(), nil
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+func parseToMessages(input string) []Message {
+	var messages []Message
+
+	// Split on message boundaries
+	parts := strings.Split(input, "<|eot_id|>")
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		// Find header
+		headerStart := strings.Index(part, "<|start_header_id|>")
+		headerEnd := strings.Index(part, "<|end_header_id|>")
+
+		if headerStart == -1 || headerEnd == -1 {
+			continue
+		}
+
+		// Extract role and content
+		role := strings.TrimSpace(part[headerStart+len("<|start_header_id|>") : headerEnd])
+		content := strings.TrimSpace(part[headerEnd+len("<|end_header_id|>"):])
+
+		// Skip empty content
+		if content == "" {
+			continue
+		}
+
+		// Handle special cases
+		switch role {
+		case "system":
+			// Remove begin_of_text marker if present
+			content = strings.TrimPrefix(content, "<|begin_of_text|>")
+		}
+
+		content = strings.TrimSpace(content)
+
+		// Only add message if we have both role and content
+		if role != "" && content != "" {
+			messages = append(messages, Message{
+				Role:    role,
+				Content: content,
+			})
+		}
+	}
+
+	return messages
 }
 
 /*
